@@ -1,0 +1,148 @@
+Model unknown
+
+  Variables:
+    x : Size=8, Index=step_option
+        Key      : Lower : Value : Upper : Fixed : Stale : Domain
+        (1, 'A') :     0 :   1.0 :     1 : False : False : Binary
+        (1, 'B') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'A') :     0 :   1.0 :     1 : False : False : Binary
+        (2, 'B') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'C') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'D') :     0 :   0.0 :     1 : False : False : Binary
+        (3, 'X') :     0 :   0.0 :     1 : False : False : Binary
+        (3, 'Y') :     0 :   1.0 :     1 : False : False : Binary
+    y : Size=16, Index=transport_routes
+        Key              : Lower : Value : Upper : Fixed : Stale : Domain
+        (1, 'A', 2, 'A') :     0 :   1.0 :     1 : False : False : Binary
+        (1, 'A', 2, 'B') :     0 :   0.0 :     1 : False : False : Binary
+        (1, 'A', 2, 'C') :     0 :   0.0 :     1 : False : False : Binary
+        (1, 'A', 2, 'D') :     0 :   0.0 :     1 : False : False : Binary
+        (1, 'B', 2, 'A') :     0 :   0.0 :     1 : False : False : Binary
+        (1, 'B', 2, 'B') :     0 :   0.0 :     1 : False : False : Binary
+        (1, 'B', 2, 'C') :     0 :   0.0 :     1 : False : False : Binary
+        (1, 'B', 2, 'D') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'A', 3, 'X') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'A', 3, 'Y') :     0 :   1.0 :     1 : False : False : Binary
+        (2, 'B', 3, 'X') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'B', 3, 'Y') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'C', 3, 'X') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'C', 3, 'Y') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'D', 3, 'X') :     0 :   0.0 :     1 : False : False : Binary
+        (2, 'D', 3, 'Y') :     0 :   0.0 :     1 : False : False : Binary
+
+  Objectives:
+    obj : Size=1, Index=None, Active=True
+        Key  : Active : Value
+        None :   True :  87.0
+
+  Constraints:
+    one_per_step : Size=3
+        Key : Lower : Body : Upper
+          1 :   1.0 :  1.0 :   1.0
+          2 :   1.0 :  1.0 :   1.0
+          3 :   1.0 :  1.0 :   1.0
+    prod_level : Size=1
+        Key  : Lower : Body  : Upper
+        None : 100.0 : 225.0 :  None
+    transport_selection_1_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :   1.0 :  1.0 :   1.0
+    transport_selection_2_3 : Size=1
+        Key  : Lower : Body : Upper
+        None :   1.0 :  1.0 :   1.0
+    link_transport_1_A_2_A_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_A_2_A_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_A_2_B_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
+    link_transport_1_A_2_B_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_A_2_C_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
+    link_transport_1_A_2_C_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_A_2_D_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
+    link_transport_1_A_2_D_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_B_2_A_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_B_2_A_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
+    link_transport_1_B_2_B_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_B_2_B_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_B_2_C_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_B_2_C_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_B_2_D_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_1_B_2_D_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_A_3_X_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
+    link_transport_2_A_3_X_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_B_3_X_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_B_3_X_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_C_3_X_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_C_3_X_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_D_3_X_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_D_3_X_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_A_3_Y_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_A_3_Y_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_B_3_Y_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_B_3_Y_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
+    link_transport_2_C_3_Y_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_C_3_Y_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
+    link_transport_2_D_3_Y_1 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None :  0.0 :   0.0
+    link_transport_2_D_3_Y_2 : Size=1
+        Key  : Lower : Body : Upper
+        None :  None : -1.0 :   0.0
