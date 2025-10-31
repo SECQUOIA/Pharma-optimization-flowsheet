@@ -1,2 +1,5 @@
 .DS_Store
 Zone.Identifier
+__pycache__/
+Enhanced_model/manufacturingData2.csv
+Enhanced_model/transportData2.csv
