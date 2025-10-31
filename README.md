@@ -27,4 +27,4 @@ The challenge is determining the best vendors to assign to each step. Computatio
 In this Jupyter notebook, we utilize the Gurobi solver to identify the optimal site for each step of the process. The class reads in the CSVs. The first contains the production information for vendors in 4 columns: the step number, the vendor name, the production amount, and the production cost. The second CSV contains the transport costs between the production sites for each step of the process. This CSV had 5 columns: the starting step, the ending step, the starting vendor, the ending vendor, and how much it cost to go between them. The optimizer class that was built ingests these CSVs and inputs them into the solver. 
 
 ### Visualization
-The second part of this notebook takes the output of the Gurobi solver and uses it to construct a graph showing the optimal solution. It then will highlight the optimal path for between steps of the process via arrows.
+The second part of this notebook takes the output of the MIP solver and uses it to construct a graph showing the optimal solution. It will then highlight the optimal path between steps of the process via arrows.
