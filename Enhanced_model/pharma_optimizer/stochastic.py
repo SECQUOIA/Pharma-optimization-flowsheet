@@ -152,19 +152,29 @@ class DemandScenarioGenerator:
 
 class StochasticProductionOptimizer:
     """
-    Two-stage stochastic production optimizer with demand uncertainty.
+    Static-dynamic two-stage stochastic production optimizer with demand uncertainty
+    and multi-echelon flow constraints.
 
-    Based on report Section 2.3 (Two-Stage Stochastic Programming):
+    Models a serial pharmaceutical supply chain where material flows sequentially
+    through manufacturing steps (e.g., API synthesis -> formulation -> fill/finish).
+    The bottleneck step governs throughput, not the sum of capacities.
 
-    First Stage (scenario-independent):
+    First Stage (static, scenario-independent):
         - Vendor selection at each step: x[s,v] in {0,1}
         - Transport route selection: y[route] in {0,1}
 
-    Second Stage (scenario-dependent):
-        - Unmet demand (shortage): u[omega] >= 0
+    Second Stage (dynamic, scenario-dependent):
+        - Material flow at each echelon: flow[s, omega] >= 0
+        - Unmet demand (shortage): unmet[omega] >= 0
+
+    Multi-echelon constraints:
+        - Per-step capacity: flow[s,w] <= capacity of selected vendor at step s
+        - Flow conservation: flow[s,w] <= flow[s-1,w] (serial chain)
+        - Demand satisfaction at final echelon only
 
     Objective: Minimize expected total cost including shortage penalty
-        min sum_omega p_omega [Production Cost + Transport Cost + Penalty * u_omega]
+        min sum(prod_cost * x) + sum(transport_cost * y)
+            + E[penalty * unmet[omega]]
     """
 
     def __init__(self,
@@ -269,6 +279,7 @@ class StochasticProductionOptimizer:
         m.y = pyo.Var(m.transport_routes, domain=pyo.Binary)  # Transport route selection
 
         # ============ SECOND-STAGE VARIABLES (scenario-dependent) ============
+        m.flow = pyo.Var(m.steps, m.scenarios, domain=pyo.NonNegativeReals)  # Material flow at each echelon
         m.unmet = pyo.Var(m.scenarios, domain=pyo.NonNegativeReals)  # Unmet demand
 
         # ============ FIRST-STAGE CONSTRAINTS ============
@@ -303,15 +314,31 @@ class StochasticProductionOptimizer:
             return mdl.y[s1, v1, s2, v2] <= mdl.x[s2, v2]
         m.link_transport_dest = pyo.Constraint(m.transport_routes, rule=link_transport_dest)
 
-        # ============ SECOND-STAGE CONSTRAINTS ============
+        # ============ SECOND-STAGE CONSTRAINTS (multi-echelon flow) ============
 
-        # Demand satisfaction with recourse (unmet demand allowed with penalty)
-        def demand_satisfaction(mdl, omega):
-            total_capacity = sum(
-                mdl.production[s, v] * mdl.x[s, v]
-                for s, v in mdl.step_option
+        first_step = self.ordered_steps[0]
+        last_step = self.ordered_steps[-1]
+
+        # Per-step capacity: flow cannot exceed selected vendor's capacity
+        def step_capacity(mdl, step, omega):
+            selected_capacity = sum(
+                mdl.production[step, v] * mdl.x[step, v]
+                for v in self.vendors[step]
             )
-            return total_capacity + mdl.unmet[omega] >= mdl.demand[omega]
+            return mdl.flow[step, omega] <= selected_capacity
+        m.step_capacity = pyo.Constraint(m.steps, m.scenarios, rule=step_capacity)
+
+        # Flow conservation: flow at step s cannot exceed flow from previous step
+        def flow_conservation(mdl, step, omega):
+            if step == first_step:
+                return pyo.Constraint.Skip
+            prev_step = self.ordered_steps[self.ordered_steps.index(step) - 1]
+            return mdl.flow[step, omega] <= mdl.flow[prev_step, omega]
+        m.flow_conservation = pyo.Constraint(m.steps, m.scenarios, rule=flow_conservation)
+
+        # Demand satisfaction at final echelon only
+        def demand_satisfaction(mdl, omega):
+            return mdl.flow[last_step, omega] + mdl.unmet[omega] >= mdl.demand[omega]
         m.demand_satisfaction = pyo.Constraint(m.scenarios, rule=demand_satisfaction)
 
         # ============ OBJECTIVE ============
@@ -355,24 +382,44 @@ class StochasticProductionOptimizer:
                 selected.append(route)
         return selected
 
+    def get_throughput(self) -> Dict[str, Dict[int, float]]:
+        """Get per-step flow values for each scenario.
+
+        Returns:
+            Dict mapping scenario name to {step: flow_value}
+        """
+        throughput = {}
+        for omega in self.model.scenarios:
+            throughput[omega] = {
+                s: pyo.value(self.model.flow[s, omega])
+                for s in self.ordered_steps
+            }
+        return throughput
+
     def get_scenario_results(self) -> pd.DataFrame:
-        """Get detailed results for each scenario."""
+        """Get detailed results for each scenario including multi-echelon throughput."""
         results = []
-        selections = self.get_selected_options()
+        last_step = self.ordered_steps[-1]
+
+        # Per-step capacities from selected vendors (same across scenarios)
+        step_capacities = {}
+        for step in self.ordered_steps:
+            step_capacities[step] = sum(
+                pyo.value(self.model.production[step, v] * self.model.x[step, v])
+                for v in self.vendors[step]
+            )
+        bottleneck_step = min(step_capacities, key=step_capacities.get)
+        bottleneck_capacity = step_capacities[bottleneck_step]
 
         for omega in self.model.scenarios:
             demand = pyo.value(self.model.demand[omega])
             prob = pyo.value(self.model.probability[omega])
 
-            # Total capacity from selected vendors
-            total_capacity = sum(
-                pyo.value(self.model.production[s, v] * self.model.x[s, v])
-                for s, v in self.model.step_option
-            )
-
+            # Actual throughput from flow variable at final echelon
+            throughput = pyo.value(self.model.flow[last_step, omega])
             unmet = pyo.value(self.model.unmet[omega])
 
-            # Scenario cost breakdown
+            # Cost breakdown
             prod_cost = sum(
                 pyo.value(self.model.prod_cost[s, v] * self.model.x[s, v])
                 for s, v in self.model.step_option
@@ -388,7 +435,8 @@ class StochasticProductionOptimizer:
                 'scenario': omega,
                 'demand': demand,
                 'probability': prob,
-                'capacity': total_capacity,
+                'bottleneck_capacity': bottleneck_capacity,
+                'throughput': throughput,
                 'unmet_demand': unmet,
                 'prod_cost': prod_cost,
                 'transport_cost': transport_cost,
@@ -422,18 +470,21 @@ class StochasticProductionOptimizer:
         selections = self.get_selected_options()
         transport_routes = self.get_selected_transport_routes()
         scenario_df = self.get_scenario_results()
-        stats = self.get_cost_statistics()
+        cost_stats = self.get_cost_statistics()
 
         print("=" * 60)
-        print("STOCHASTIC OPTIMIZATION RESULTS (Demand Uncertainty)")
+        print("STATIC-DYNAMIC STOCHASTIC OPTIMIZATION RESULTS")
+        print("(Multi-Echelon with Demand Uncertainty)")
         print("=" * 60)
 
-        print("\n--- FIRST-STAGE DECISIONS (Fixed) ---")
+        print("\n--- FIRST-STAGE DECISIONS (Static) ---")
         print("\nSelected vendors by step:")
+        step_capacities = {}
         for step in sorted(selections.keys()):
             vendor = selections[step]
             prod_cost = self.cost_dict[(step, vendor)]
             production = self.prod_dict[(step, vendor)]
+            step_capacities[step] = production
             print(f"  Step {step}: {vendor} (Cost: ${prod_cost:,}, Capacity: {production:,})")
 
         print("\nSelected transport routes:")
@@ -444,12 +495,22 @@ class StochasticProductionOptimizer:
         path_str = " -> ".join([f"Step {s}({selections[s]})" for s in sorted(selections.keys())])
         print(f"\nOptimal Path: {path_str}")
 
-        print("\n--- SCENARIO ANALYSIS ---")
+        # Multi-echelon throughput analysis
+        bottleneck_step = min(step_capacities, key=step_capacities.get)
+        bottleneck_cap = step_capacities[bottleneck_step]
+        print("\n--- MULTI-ECHELON THROUGHPUT ---")
+        print("Per-step capacity of selected vendors:")
+        for step in sorted(step_capacities.keys()):
+            marker = " <-- BOTTLENECK" if step == bottleneck_step else ""
+            print(f"  Step {step}: {step_capacities[step]:,}{marker}")
+        print(f"\nEffective throughput (bottleneck): {bottleneck_cap:,}")
+
+        print("\n--- SECOND-STAGE RESULTS (Dynamic per Scenario) ---")
         print(scenario_df.to_string(index=False, float_format=lambda x: f"{x:,.2f}"))
 
         print("\n--- COST STATISTICS ---")
-        print(f"Expected Cost:     ${stats['expected_cost']:,.2f}")
-        print(f"Std Deviation:     ${stats['std_dev']:,.2f}")
-        print(f"Minimum Cost:      ${stats['min_cost']:,.2f}")
-        print(f"Maximum Cost:      ${stats['max_cost']:,.2f}")
+        print(f"Expected Cost:     ${cost_stats['expected_cost']:,.2f}")
+        print(f"Std Deviation:     ${cost_stats['std_dev']:,.2f}")
+        print(f"Minimum Cost:      ${cost_stats['min_cost']:,.2f}")
+        print(f"Maximum Cost:      ${cost_stats['max_cost']:,.2f}")
         print("=" * 60)
