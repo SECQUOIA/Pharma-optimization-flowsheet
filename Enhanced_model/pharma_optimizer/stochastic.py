@@ -19,6 +19,10 @@ class DemandScenarioGenerator:
     Supports multiple distribution types for modeling demand uncertainty:
     - Discrete Low/Base/High scenarios
     - Truncated Normal distribution
+    - Non-Stationary (time-varying mean with trend and seasonality)
+    - Lumpy / Intermittent (sporadic large orders, many zero-demand periods)
+    - Slow-Moving (low-volume Poisson demand)
+    - Binomial (fixed population, each with probability of needing product)
     - Custom scenario sets
 
     Based on Section 2 of the uncertainty report:
@@ -99,6 +103,214 @@ class DemandScenarioGenerator:
         for i, q in enumerate(quantiles):
             demand = stats.truncnorm.ppf(q, a, b, loc=self.mean_demand, scale=self.std_demand)
             scenarios[f'scenario_{i+1}'] = (demand, prob)
+
+        return scenarios
+
+    def generate_nonstationary_scenarios(self,
+                                        time_point: float,
+                                        trend_rate: float = 0.05,
+                                        amplitude: float = 0.0,
+                                        period: float = 12.0,
+                                        num_scenarios: int = 5
+                                       ) -> Dict[str, Tuple[float, float]]:
+        """Generate scenarios from a non-stationary demand distribution.
+
+        Models demand where the mean shifts over time due to trend and/or
+        seasonality. At a given time point t, demand is drawn from a
+        truncated normal with time-varying mean:
+
+            mu(t) = mean_demand * (1 + trend_rate * t)
+                    + amplitude * sin(2 * pi * t / period)
+
+        Args:
+            time_point: The time index at which to generate scenarios
+            trend_rate: Linear growth rate per time unit (e.g., 0.05 = 5% growth)
+            amplitude: Amplitude of seasonal component (in demand units)
+            period: Period of seasonal cycle (e.g., 12 for monthly data with yearly cycle)
+            num_scenarios: Number of equiprobable scenarios to generate
+
+        Returns:
+            Dictionary mapping scenario name to (demand, probability)
+        """
+        # Time-varying mean
+        mu_t = (self.mean_demand * (1 + trend_rate * time_point)
+                + amplitude * np.sin(2 * np.pi * time_point / period))
+        mu_t = max(mu_t, self.min_demand)
+        sigma_t = self.cv * mu_t
+
+        # Truncated normal at this time point
+        lower = max(self.min_demand, 0)
+        a = (lower - mu_t) / sigma_t if sigma_t > 0 else 0
+        b = np.inf
+
+        prob = 1.0 / num_scenarios
+        quantiles = [(i + 0.5) / num_scenarios for i in range(num_scenarios)]
+
+        scenarios = {}
+        for i, q in enumerate(quantiles):
+            demand = stats.truncnorm.ppf(q, a, b, loc=mu_t, scale=sigma_t)
+            scenarios[f'ns_t{time_point}_{i+1}'] = (max(demand, lower), prob)
+
+        return scenarios
+
+    def generate_lumpy_scenarios(self,
+                                 occurrence_prob: float = 0.3,
+                                 size_mean: Optional[float] = None,
+                                 size_cv: float = 0.5,
+                                 num_scenarios: int = 5
+                                ) -> Dict[str, Tuple[float, float]]:
+        """Generate scenarios from a lumpy/intermittent demand distribution.
+
+        Models demand that occurs sporadically with large quantities.
+        Characterized by high inter-demand intervals and high variance
+        when demand occurs (ADI > 1.32, CV^2 > 0.49).
+
+        Uses a compound distribution:
+            D = B * X
+        where B ~ Bernoulli(occurrence_prob) and X ~ LogNormal(mu_ln, sigma_ln)
+
+        One scenario always represents zero demand (no occurrence).
+        The remaining scenarios discretize the non-zero demand distribution.
+
+        Args:
+            occurrence_prob: Probability that any demand occurs in a period (0, 1)
+            size_mean: Mean demand size when it occurs (defaults to mean_demand)
+            size_cv: CV of demand size when it occurs (default 0.5)
+            num_scenarios: Total number of scenarios (>= 2, one is always zero-demand)
+
+        Returns:
+            Dictionary mapping scenario name to (demand, probability)
+        """
+        if num_scenarios < 2:
+            raise ValueError("num_scenarios must be >= 2 for lumpy demand")
+        if not 0 < occurrence_prob < 1:
+            raise ValueError("occurrence_prob must be in (0, 1)")
+
+        if size_mean is None:
+            size_mean = self.mean_demand
+
+        # LogNormal parameters from mean and cv of the size distribution
+        sigma_ln = np.sqrt(np.log(1 + size_cv**2))
+        mu_ln = np.log(size_mean) - 0.5 * sigma_ln**2
+
+        scenarios = {}
+
+        # Zero-demand scenario
+        scenarios['no_demand'] = (0.0, 1.0 - occurrence_prob)
+
+        # Non-zero scenarios: equiprobable discretization of LogNormal
+        n_nonzero = num_scenarios - 1
+        prob_each = occurrence_prob / n_nonzero
+        quantiles = [(i + 0.5) / n_nonzero for i in range(n_nonzero)]
+
+        for i, q in enumerate(quantiles):
+            demand = stats.lognorm.ppf(q, s=sigma_ln, scale=np.exp(mu_ln))
+            scenarios[f'lumpy_{i+1}'] = (demand, prob_each)
+
+        return scenarios
+
+    def generate_slow_moving_scenarios(self,
+                                        mean_rate: Optional[float] = None,
+                                        num_scenarios: int = 5
+                                       ) -> Dict[str, Tuple[float, float]]:
+        """Generate scenarios from a slow-moving (Poisson) demand distribution.
+
+        Models low-volume demand with many zero periods and small order sizes.
+        Characterized by high inter-demand intervals but low variance when
+        demand occurs (ADI > 1.32, CV^2 <= 0.49).
+
+        D ~ Poisson(lambda) where lambda = mean_rate.
+
+        Selects the most probable demand values from the Poisson PMF and
+        groups remaining tail probability into boundary scenarios.
+
+        Args:
+            mean_rate: Poisson rate parameter lambda (defaults to mean_demand)
+            num_scenarios: Number of scenarios to generate
+
+        Returns:
+            Dictionary mapping scenario name to (demand, probability)
+        """
+        if mean_rate is None:
+            mean_rate = self.mean_demand
+
+        # Compute PMF for values covering 99.9% of probability mass
+        max_k = int(stats.poisson.ppf(0.999, mean_rate)) + 1
+        k_values = np.arange(0, max_k + 1)
+        pmf_values = stats.poisson.pmf(k_values, mean_rate)
+
+        if num_scenarios >= len(k_values):
+            # Fewer unique values than scenarios — use exact PMF
+            scenarios = {}
+            for k, p in zip(k_values, pmf_values):
+                if p > 1e-10:
+                    scenarios[f'poisson_{int(k)}'] = (float(k), float(p))
+            # Normalize for any tail truncation
+            total_p = sum(p for _, p in scenarios.values())
+            scenarios = {name: (d, p / total_p) for name, (d, p) in scenarios.items()}
+            return scenarios
+
+        # Group into num_scenarios equiprobable bins via quantile boundaries
+        prob = 1.0 / num_scenarios
+        scenarios = {}
+        for i in range(num_scenarios):
+            q_lo = i / num_scenarios
+            q_hi = (i + 1) / num_scenarios
+            q_mid = (q_lo + q_hi) / 2
+
+            demand = stats.poisson.ppf(q_mid, mean_rate)
+            scenarios[f'slow_{i+1}'] = (float(demand), prob)
+
+        return scenarios
+
+    def generate_binomial_scenarios(self,
+                                     num_trials: int,
+                                     prob_success: float,
+                                     num_scenarios: int = 5
+                                    ) -> Dict[str, Tuple[float, float]]:
+        """Generate scenarios from a binomial demand distribution.
+
+        Models demand as the number of successes from a fixed population,
+        e.g., a patient population of size n where each patient independently
+        needs the drug with probability p.
+
+        D ~ Binomial(n, p)  with mean = n*p, variance = n*p*(1-p).
+
+        Args:
+            num_trials: Population size n (number of independent trials)
+            prob_success: Probability each trial generates demand (0, 1)
+            num_scenarios: Number of scenarios to generate
+
+        Returns:
+            Dictionary mapping scenario name to (demand, probability)
+        """
+        if not 0 < prob_success < 1:
+            raise ValueError("prob_success must be in (0, 1)")
+
+        # Compute PMF for the full support [0, n]
+        k_values = np.arange(0, num_trials + 1)
+        pmf_values = stats.binom.pmf(k_values, num_trials, prob_success)
+
+        # Filter to values with non-negligible probability
+        mask = pmf_values > 1e-10
+        k_values = k_values[mask]
+        pmf_values = pmf_values[mask]
+
+        if num_scenarios >= len(k_values):
+            # Fewer unique values than scenarios — use exact PMF
+            scenarios = {}
+            total_p = pmf_values.sum()
+            for k, p in zip(k_values, pmf_values):
+                scenarios[f'binom_{int(k)}'] = (float(k), float(p / total_p))
+            return scenarios
+
+        # Group into num_scenarios equiprobable bins via quantile discretization
+        prob = 1.0 / num_scenarios
+        scenarios = {}
+        for i in range(num_scenarios):
+            q_mid = (i + 0.5) / num_scenarios
+            demand = stats.binom.ppf(q_mid, num_trials, prob_success)
+            scenarios[f'binom_{i+1}'] = (float(demand), prob)
 
         return scenarios
 
