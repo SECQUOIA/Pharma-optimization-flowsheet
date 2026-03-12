@@ -7,21 +7,24 @@ Classes:
     Generator: Generates random test instances
     EnhancedProductionOptimizer: Deterministic optimization model
     DemandScenarioGenerator: Generates demand scenarios for stochastic optimization
-    StochasticProductionOptimizer: Two-stage stochastic optimization model
+    StochasticProductionOptimizer: Two-stage stochastic optimization model (mpi-sppy)
 
 Functions:
+    pharma_scenario_creator: mpi-sppy scenario creator for direct use with EF/PH
     visualize_solution_from_optimizer: Visualize optimization solutions
 """
 
-from .generator import Generator
-from .deterministic import EnhancedProductionOptimizer
-from .stochastic import DemandScenarioGenerator, StochasticProductionOptimizer
-from .visualization import visualize_solution_from_optimizer
+from .instance_generator import Generator
+from .deterministic_optimization import EnhancedProductionOptimizer
+from .stochastic import DemandScenarioGenerator, StochasticProductionOptimizer, pharma_scenario_creator
+from .visualization import visualize_solution_from_optimizer, visualize_scenarios
 
 __all__ = [
     'Generator',
     'EnhancedProductionOptimizer',
     'DemandScenarioGenerator',
     'StochasticProductionOptimizer',
+    'pharma_scenario_creator',
     'visualize_solution_from_optimizer',
+    'visualize_scenarios'
 ]

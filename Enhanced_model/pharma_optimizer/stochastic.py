@@ -1,8 +1,13 @@
 """Stochastic optimization for pharmaceutical manufacturing with demand uncertainty.
 
-This module provides classes for:
+This module provides:
 - DemandScenarioGenerator: Generate demand scenarios for uncertainty modeling
-- StochasticProductionOptimizer: Two-stage stochastic programming model
+- pharma_scenario_creator: mpi-sppy-compatible scenario creator function
+- StochasticProductionOptimizer: Two-stage stochastic programming model (via mpi-sppy)
+
+mpi-sppy is used for:
+- Extensive Form (EF) assembly and solving
+- Progressive Hedging (PH) decomposition for large-scale problems
 """
 
 import numpy as np
@@ -11,6 +16,14 @@ from typing import Dict, List, Tuple, Optional
 
 import pyomo.environ as pyo
 import pandas as pd
+
+try:
+    import mpisppy.utils.sputils as sputils
+    from mpisppy.opt.ef import ExtensiveForm
+    from mpisppy.opt.ph import PH
+    _MPISPPY_AVAILABLE = True
+except ImportError:
+    _MPISPPY_AVAILABLE = False
 
 
 class DemandScenarioGenerator:
@@ -362,10 +375,175 @@ class DemandScenarioGenerator:
         print(f"CV:              {std/expected:.2%}")
 
 
+def pharma_scenario_creator(
+    scenario_name: str,
+    scenarios: Dict[str, Tuple[float, float]],
+    vendors: Dict,
+    pairs: List[Tuple],
+    prod_dict: Dict,
+    cost_dict: Dict,
+    transport_dict: Dict,
+    transport_routes: List[Tuple],
+    ordered_steps: List,
+    shortage_penalty: float,
+) -> pyo.ConcreteModel:
+    """mpi-sppy scenario creator for the pharmaceutical stochastic program.
+
+    Builds a Pyomo ConcreteModel for a single demand scenario. First-stage
+    variables (vendor and route selection) are marked as non-anticipativity
+    variables so mpi-sppy can enforce consistency across scenarios in the
+    Extensive Form or Progressive Hedging decomposition.
+
+    Args:
+        scenario_name: Key into `scenarios` dict identifying this scenario.
+        scenarios: Full dict mapping scenario_name -> (demand, probability).
+        vendors: Dict mapping step -> list of vendor names.
+        pairs: List of (step, vendor) tuples.
+        prod_dict: Dict mapping (step, vendor) -> production capacity.
+        cost_dict: Dict mapping (step, vendor) -> production cost.
+        transport_dict: Dict mapping route tuple -> transport cost.
+        transport_routes: List of (src_step, src_vendor, dst_step, dst_vendor) tuples.
+        ordered_steps: Sorted list of manufacturing steps.
+        shortage_penalty: Cost per unit of unmet demand.
+
+    Returns:
+        Pyomo ConcreteModel annotated with mpi-sppy non-anticipativity metadata.
+    """
+    if not _MPISPPY_AVAILABLE:
+        raise ImportError(
+            "mpi-sppy is required. Install with: pip install mpi-sppy"
+        )
+
+    demand, prob = scenarios[scenario_name]
+    first_step = ordered_steps[0]
+    last_step = ordered_steps[-1]
+
+    m = pyo.ConcreteModel()
+
+    # ============ SETS ============
+    m.steps = pyo.Set(initialize=vendors.keys())
+    m.step_option = pyo.Set(dimen=2, initialize=pairs)
+    m.transport_routes = pyo.Set(dimen=4, initialize=transport_routes)
+
+    # ============ PARAMETERS ============
+    m.production = pyo.Param(
+        m.step_option,
+        initialize=prod_dict,
+        within=pyo.NonNegativeReals
+    )
+    m.prod_cost = pyo.Param(
+        m.step_option,
+        initialize=cost_dict,
+        within=pyo.NonNegativeReals
+    )
+    m.transport_cost = pyo.Param(
+        m.transport_routes,
+        initialize=transport_dict,
+        within=pyo.NonNegativeReals
+    )
+    m.demand = pyo.Param(initialize=demand, within=pyo.NonNegativeReals)
+    m.shortage_penalty = pyo.Param(initialize=shortage_penalty, within=pyo.NonNegativeReals)
+
+    # ============ FIRST-STAGE VARIABLES (non-anticipativity) ============
+    m.x = pyo.Var(m.step_option, domain=pyo.Binary)       # Vendor selection
+    m.y = pyo.Var(m.transport_routes, domain=pyo.Binary)  # Transport route selection
+
+    # ============ SECOND-STAGE VARIABLES (scenario-specific) ============
+    m.flow = pyo.Var(m.steps, domain=pyo.NonNegativeReals)  # Material flow at each echelon
+    m.unmet = pyo.Var(domain=pyo.NonNegativeReals)           # Unmet demand (recourse)
+
+    # ============ FIRST-STAGE CONSTRAINTS ============
+
+    # One vendor per step
+    def one_per_step(mdl, step):
+        return sum(mdl.x[step, v] for v in vendors[step]) == 1
+    m.one_per_step = pyo.Constraint(m.steps, rule=one_per_step)
+
+    # One transport route per consecutive step pair
+    for i in range(len(ordered_steps) - 1):
+        step1, step2 = ordered_steps[i], ordered_steps[i + 1]
+
+        def transport_selection_rule(mdl, s1=step1, s2=step2):
+            valid_routes = [
+                (r1, v1, r2, v2) for (r1, v1, r2, v2) in transport_routes
+                if r1 == s1 and r2 == s2
+            ]
+            if valid_routes:
+                return sum(mdl.y[route] for route in valid_routes) == 1
+            return pyo.Constraint.Skip
+
+        setattr(m, f'transport_selection_{step1}_{step2}',
+                pyo.Constraint(rule=transport_selection_rule))
+
+    # Link transport routes to vendor selection
+    def link_transport_source(mdl, s1, v1, s2, v2):
+        return mdl.y[s1, v1, s2, v2] <= mdl.x[s1, v1]
+    m.link_transport_source = pyo.Constraint(m.transport_routes, rule=link_transport_source)
+
+    def link_transport_dest(mdl, s1, v1, s2, v2):
+        return mdl.y[s1, v1, s2, v2] <= mdl.x[s2, v2]
+    m.link_transport_dest = pyo.Constraint(m.transport_routes, rule=link_transport_dest)
+
+    # ============ SECOND-STAGE CONSTRAINTS (multi-echelon flow) ============
+
+    # Per-step capacity: flow cannot exceed selected vendor's capacity
+    def step_capacity(mdl, step):
+        selected_capacity = sum(
+            mdl.production[step, v] * mdl.x[step, v]
+            for v in vendors[step]
+        )
+        return mdl.flow[step] <= selected_capacity
+    m.step_capacity = pyo.Constraint(m.steps, rule=step_capacity)
+
+    # Flow conservation: flow at step s cannot exceed flow from previous step
+    def flow_conservation(mdl, step):
+        if step == first_step:
+            return pyo.Constraint.Skip
+        prev_step = ordered_steps[ordered_steps.index(step) - 1]
+        return mdl.flow[step] <= mdl.flow[prev_step]
+    m.flow_conservation = pyo.Constraint(m.steps, rule=flow_conservation)
+
+    # Demand satisfaction at final echelon only
+    def demand_satisfaction(mdl):
+        return mdl.flow[last_step] + mdl.unmet >= mdl.demand
+    m.demand_satisfaction = pyo.Constraint(rule=demand_satisfaction)
+
+    # ============ COST EXPRESSIONS ============
+    # First-stage cost: paid regardless of scenario (vendor + transport selection)
+    m.FirstStageCost = pyo.Expression(
+        expr=sum(m.prod_cost[s, v] * m.x[s, v] for s, v in m.step_option)
+             + sum(m.transport_cost[r] * m.y[r] for r in m.transport_routes)
+    )
+
+    # Second-stage cost: scenario-specific shortage recourse
+    m.SecondStageCost = pyo.Expression(expr=m.shortage_penalty * m.unmet)
+
+    # ============ OBJECTIVE (per-scenario total cost, NOT probability-weighted) ============
+    # mpi-sppy weights by _mpisppy_probability when assembling the EF objective:
+    #   EF obj = sum_omega [ prob_omega * (FirstStageCost + SecondStageCost_omega) ]
+    #          = FirstStageCost + E[SecondStageCost]   (since sum prob_omega = 1)
+    m.obj = pyo.Objective(
+        expr=m.FirstStageCost + m.SecondStageCost,
+        sense=pyo.minimize
+    )
+
+    # ============ mpi-sppy NON-ANTICIPATIVITY ANNOTATION ============
+    # Set scenario probability before attach_root_node so it is not overridden.
+    m._mpisppy_probability = prob
+
+    # attach_root_node registers:
+    #   - the first-stage cost expression (used by PH proximal term)
+    #   - the list of first-stage (non-anticipative) variables
+    # varlist takes Pyomo Var objects; build_vardatalist expands indexed vars.
+    sputils.attach_root_node(m, m.FirstStageCost, [m.x, m.y])
+
+    return m
+
+
 class StochasticProductionOptimizer:
     """
     Static-dynamic two-stage stochastic production optimizer with demand uncertainty
-    and multi-echelon flow constraints.
+    and multi-echelon flow constraints. Uses mpi-sppy for scenario management and solving.
 
     Models a serial pharmaceutical supply chain where material flows sequentially
     through manufacturing steps (e.g., API synthesis -> formulation -> fill/finish).
@@ -376,13 +554,14 @@ class StochasticProductionOptimizer:
         - Transport route selection: y[route] in {0,1}
 
     Second Stage (dynamic, scenario-dependent):
-        - Material flow at each echelon: flow[s, omega] >= 0
-        - Unmet demand (shortage): unmet[omega] >= 0
+        - Material flow at each echelon: flow[s] >= 0  (per scenario)
+        - Unmet demand (shortage): unmet >= 0           (per scenario)
 
-    Multi-echelon constraints:
-        - Per-step capacity: flow[s,w] <= capacity of selected vendor at step s
-        - Flow conservation: flow[s,w] <= flow[s-1,w] (serial chain)
-        - Demand satisfaction at final echelon only
+    Solved via mpi-sppy:
+        - Extensive Form (EF): assembles and solves the full deterministic
+          equivalent in a single pass. Exact, scales to ~hundreds of scenarios.
+        - Progressive Hedging (PH): Lagrangian decomposition by scenario.
+          Heuristic for MIPs, exact for LPs. Scales to thousands of scenarios.
 
     Objective: Minimize expected total cost including shortage penalty
         min sum(prod_cost * x) + sum(transport_cost * y)
@@ -403,6 +582,11 @@ class StochasticProductionOptimizer:
             scenarios: Dict mapping scenario_name -> (demand, probability)
             shortage_penalty: Penalty cost per unit of unmet demand
         """
+        if not _MPISPPY_AVAILABLE:
+            raise ImportError(
+                "mpi-sppy is required. Install with: pip install mpi-sppy"
+            )
+
         # Load production data
         self.prod_df = pd.read_csv(prod_cost_csv)
         self.transport_df = pd.read_csv(transport_cost_csv)
@@ -440,159 +624,114 @@ class StochasticProductionOptimizer:
         self.transport_routes = list(self.transport_dict.keys())
         self.ordered_steps = sorted(self.vendors.keys())
 
-        # Build stochastic model
-        self._build_model()
+        # Populated after solve()
+        self._ef: Optional[ExtensiveForm] = None
+        self._ph: Optional[PH] = None
 
-    def _build_model(self):
-        """Build the two-stage stochastic Pyomo model."""
-        m = pyo.ConcreteModel()
+    def _creator_kwargs(self) -> dict:
+        """Build the kwargs dict for pharma_scenario_creator."""
+        return {
+            'scenarios': self.scenarios,
+            'vendors': self.vendors,
+            'pairs': self.pairs,
+            'prod_dict': self.prod_dict,
+            'cost_dict': self.cost_dict,
+            'transport_dict': self.transport_dict,
+            'transport_routes': self.transport_routes,
+            'ordered_steps': self.ordered_steps,
+            'shortage_penalty': self.shortage_penalty,
+        }
 
-        # ============ SETS ============
-        m.steps = pyo.Set(initialize=self.vendors.keys())
-        m.step_option = pyo.Set(dimen=2, initialize=self.pairs)
-        m.transport_routes = pyo.Set(dimen=4, initialize=self.transport_routes)
-        m.scenarios = pyo.Set(initialize=self.scenarios.keys())
+    def solve(
+        self,
+        solver_name: str = 'glpk',
+        tee: bool = False,
+        method: str = 'ef',
+        ph_options: Optional[dict] = None,
+    ):
+        """Solve the two-stage stochastic program via mpi-sppy.
 
-        # ============ PARAMETERS ============
-        m.production = pyo.Param(
-            m.step_option,
-            initialize=self.prod_dict,
-            within=pyo.NonNegativeReals
-        )
-        m.prod_cost = pyo.Param(
-            m.step_option,
-            initialize=self.cost_dict,
-            within=pyo.NonNegativeReals
-        )
-        m.transport_cost = pyo.Param(
-            m.transport_routes,
-            initialize=self.transport_dict,
-            within=pyo.NonNegativeReals
-        )
+        Args:
+            solver_name: MIP solver name recognised by Pyomo (e.g. 'glpk', 'cplex', 'gurobi').
+            tee: Stream solver output to stdout.
+            method: 'ef' for Extensive Form (exact, default) or 'ph' for Progressive Hedging.
+            ph_options: Override options for PH. Relevant keys:
+                - 'PHIterLimit' (default 50)
+                - 'defaultPHrho' (default 1.0)
+                - 'defaultPHp'   (default 2)
 
-        # Scenario-dependent parameters
-        m.demand = pyo.Param(
-            m.scenarios,
-            initialize={s: self.scenarios[s][0] for s in self.scenarios},
-            within=pyo.NonNegativeReals
-        )
-        m.probability = pyo.Param(
-            m.scenarios,
-            initialize={s: self.scenarios[s][1] for s in self.scenarios},
-            within=pyo.NonNegativeReals
-        )
-        m.shortage_penalty = pyo.Param(
-            initialize=self.shortage_penalty,
-            within=pyo.NonNegativeReals
-        )
+        Returns:
+            For 'ef': the Pyomo solver results object from ExtensiveForm.solve_extensive_form().
+            For 'ph': None (convergence info available via self._ph).
+        """
+        scenario_names = list(self.scenarios.keys())
+        kwargs = self._creator_kwargs()
 
-        # ============ FIRST-STAGE VARIABLES (scenario-independent) ============
-        m.x = pyo.Var(m.step_option, domain=pyo.Binary)  # Vendor selection
-        m.y = pyo.Var(m.transport_routes, domain=pyo.Binary)  # Transport route selection
+        if method == 'ph':
+            default_ph_opts = {
+                'solvername': solver_name,
+                'PHIterLimit': 50,
+                'defaultPHrho': 1.0,
+                'defaultPHp': 2,
+                'convthresh': 1e-4,
+                'verbose': False,
+                'display_progress': False,
+                'display_convergence_detail': False,
+                'linearize_proximal_terms': False,
+            }
+            if ph_options:
+                default_ph_opts.update(ph_options)
 
-        # ============ SECOND-STAGE VARIABLES (scenario-dependent) ============
-        m.flow = pyo.Var(m.steps, m.scenarios, domain=pyo.NonNegativeReals)  # Material flow at each echelon
-        m.unmet = pyo.Var(m.scenarios, domain=pyo.NonNegativeReals)  # Unmet demand
-
-        # ============ FIRST-STAGE CONSTRAINTS ============
-
-        # One vendor per step
-        def one_per_step(mdl, step):
-            return sum(mdl.x[step, v] for v in self.vendors[step]) == 1
-        m.one_per_step = pyo.Constraint(m.steps, rule=one_per_step)
-
-        # One transport route per consecutive step pair
-        for i in range(len(self.ordered_steps) - 1):
-            step1, step2 = self.ordered_steps[i], self.ordered_steps[i + 1]
-
-            def transport_selection_rule(mdl, s1=step1, s2=step2):
-                valid_routes = [
-                    (r1, v1, r2, v2) for (r1, v1, r2, v2) in self.transport_routes
-                    if r1 == s1 and r2 == s2
-                ]
-                if valid_routes:
-                    return sum(mdl.y[route] for route in valid_routes) == 1
-                return pyo.Constraint.Skip
-
-            setattr(m, f'transport_selection_{step1}_{step2}',
-                   pyo.Constraint(rule=transport_selection_rule))
-
-        # Link transport routes to vendor selection
-        def link_transport_source(mdl, s1, v1, s2, v2):
-            return mdl.y[s1, v1, s2, v2] <= mdl.x[s1, v1]
-        m.link_transport_source = pyo.Constraint(m.transport_routes, rule=link_transport_source)
-
-        def link_transport_dest(mdl, s1, v1, s2, v2):
-            return mdl.y[s1, v1, s2, v2] <= mdl.x[s2, v2]
-        m.link_transport_dest = pyo.Constraint(m.transport_routes, rule=link_transport_dest)
-
-        # ============ SECOND-STAGE CONSTRAINTS (multi-echelon flow) ============
-
-        first_step = self.ordered_steps[0]
-        last_step = self.ordered_steps[-1]
-
-        # Per-step capacity: flow cannot exceed selected vendor's capacity
-        def step_capacity(mdl, step, omega):
-            selected_capacity = sum(
-                mdl.production[step, v] * mdl.x[step, v]
-                for v in self.vendors[step]
+            self._ph = PH(
+                default_ph_opts,
+                scenario_names,
+                pharma_scenario_creator,
+                scenario_creator_kwargs=kwargs,
             )
-            return mdl.flow[step, omega] <= selected_capacity
-        m.step_capacity = pyo.Constraint(m.steps, m.scenarios, rule=step_capacity)
+            self._ph.ph_main()
+            self._ef = None
+            return None
 
-        # Flow conservation: flow at step s cannot exceed flow from previous step
-        def flow_conservation(mdl, step, omega):
-            if step == first_step:
-                return pyo.Constraint.Skip
-            prev_step = self.ordered_steps[self.ordered_steps.index(step) - 1]
-            return mdl.flow[step, omega] <= mdl.flow[prev_step, omega]
-        m.flow_conservation = pyo.Constraint(m.steps, m.scenarios, rule=flow_conservation)
+        # Default: Extensive Form
+        # options dict must contain 'solver' key for ExtensiveForm
+        self._ef = ExtensiveForm(
+            {'solver': solver_name},
+            scenario_names,
+            pharma_scenario_creator,
+            scenario_creator_kwargs=kwargs,
+        )
+        results = self._ef.solve_extensive_form(tee=tee)
+        self._ph = None
+        return results
 
-        # Demand satisfaction at final echelon only
-        def demand_satisfaction(mdl, omega):
-            return mdl.flow[last_step, omega] + mdl.unmet[omega] >= mdl.demand[omega]
-        m.demand_satisfaction = pyo.Constraint(m.scenarios, rule=demand_satisfaction)
+    def _active_scenarios(self) -> Dict[str, pyo.ConcreteModel]:
+        """Return the dict of solved scenario submodels."""
+        if self._ef is not None:
+            return self._ef.local_scenarios
+        if self._ph is not None:
+            return self._ph.local_scenarios
+        raise RuntimeError("Model has not been solved yet. Call solve() first.")
 
-        # ============ OBJECTIVE ============
-        # Expected cost = production cost + transport cost + E[shortage penalty]
-        def expected_cost(mdl):
-            # First-stage costs (deterministic, paid regardless of scenario)
-            prod_cost_expr = sum(mdl.prod_cost[s, v] * mdl.x[s, v] for s, v in mdl.step_option)
-            transport_cost_expr = sum(mdl.transport_cost[r] * mdl.y[r] for r in mdl.transport_routes)
-
-            # Second-stage expected shortage penalty
-            shortage_cost_expr = sum(
-                mdl.probability[omega] * mdl.shortage_penalty * mdl.unmet[omega]
-                for omega in mdl.scenarios
-            )
-
-            return prod_cost_expr + transport_cost_expr + shortage_cost_expr
-
-        m.obj = pyo.Objective(rule=expected_cost, sense=pyo.minimize)
-
-        self.model = m
-
-    def solve(self, solver_name: str = 'glpk', tee: bool = False):
-        """Solve the stochastic optimization model."""
-        opt = pyo.SolverFactory(solver_name)
-        result = opt.solve(self.model, tee=tee)
-        return result
+    def _first_stage_model(self) -> pyo.ConcreteModel:
+        """Return any one scenario model to read first-stage decisions from."""
+        return next(iter(self._active_scenarios().values()))
 
     def get_selected_options(self) -> Dict[int, str]:
         """Get selected vendor for each step."""
+        m = self._first_stage_model()
         selections = {}
-        for (s, v) in self.model.step_option:
-            if pyo.value(self.model.x[s, v]) > 0.5:
+        for (s, v) in m.step_option:
+            if pyo.value(m.x[s, v]) > 0.5:
                 selections[s] = v
         return selections
 
     def get_selected_transport_routes(self) -> List[Tuple]:
         """Get selected transport routes."""
-        selected = []
-        for route in self.model.transport_routes:
-            if pyo.value(self.model.y[route]) > 0.5:
-                selected.append(route)
-        return selected
+        m = self._first_stage_model()
+        return [
+            route for route in m.transport_routes
+            if pyo.value(m.y[route]) > 0.5
+        ]
 
     def get_throughput(self) -> Dict[str, Dict[int, float]]:
         """Get per-step flow values for each scenario.
@@ -600,51 +739,47 @@ class StochasticProductionOptimizer:
         Returns:
             Dict mapping scenario name to {step: flow_value}
         """
-        throughput = {}
-        for omega in self.model.scenarios:
-            throughput[omega] = {
-                s: pyo.value(self.model.flow[s, omega])
-                for s in self.ordered_steps
-            }
-        return throughput
+        return {
+            sname: {s: pyo.value(smodel.flow[s]) for s in self.ordered_steps}
+            for sname, smodel in self._active_scenarios().items()
+        }
 
     def get_scenario_results(self) -> pd.DataFrame:
         """Get detailed results for each scenario including multi-echelon throughput."""
-        results = []
         last_step = self.ordered_steps[-1]
+        m_fs = self._first_stage_model()
 
         # Per-step capacities from selected vendors (same across scenarios)
-        step_capacities = {}
-        for step in self.ordered_steps:
-            step_capacities[step] = sum(
-                pyo.value(self.model.production[step, v] * self.model.x[step, v])
+        step_capacities = {
+            step: sum(
+                pyo.value(m_fs.production[step, v] * m_fs.x[step, v])
                 for v in self.vendors[step]
             )
+            for step in self.ordered_steps
+        }
         bottleneck_step = min(step_capacities, key=step_capacities.get)
         bottleneck_capacity = step_capacities[bottleneck_step]
 
-        for omega in self.model.scenarios:
-            demand = pyo.value(self.model.demand[omega])
-            prob = pyo.value(self.model.probability[omega])
+        prod_cost = sum(
+            pyo.value(m_fs.prod_cost[s, v] * m_fs.x[s, v])
+            for s, v in m_fs.step_option
+        )
+        transport_cost = sum(
+            pyo.value(m_fs.transport_cost[r] * m_fs.y[r])
+            for r in m_fs.transport_routes
+        )
 
-            # Actual throughput from flow variable at final echelon
-            throughput = pyo.value(self.model.flow[last_step, omega])
-            unmet = pyo.value(self.model.unmet[omega])
-
-            # Cost breakdown
-            prod_cost = sum(
-                pyo.value(self.model.prod_cost[s, v] * self.model.x[s, v])
-                for s, v in self.model.step_option
-            )
-            transport_cost = sum(
-                pyo.value(self.model.transport_cost[r] * self.model.y[r])
-                for r in self.model.transport_routes
-            )
+        results = []
+        for sname, smodel in self._active_scenarios().items():
+            demand = pyo.value(smodel.demand)
+            prob = self.scenarios[sname][1]
+            throughput = pyo.value(smodel.flow[last_step])
+            unmet = pyo.value(smodel.unmet)
             shortage_cost = self.shortage_penalty * unmet
             total_cost = prod_cost + transport_cost + shortage_cost
 
             results.append({
-                'scenario': omega,
+                'scenario': sname,
                 'demand': demand,
                 'probability': prob,
                 'bottleneck_capacity': bottleneck_capacity,
@@ -653,14 +788,18 @@ class StochasticProductionOptimizer:
                 'prod_cost': prod_cost,
                 'transport_cost': transport_cost,
                 'shortage_cost': shortage_cost,
-                'total_cost': total_cost
+                'total_cost': total_cost,
             })
 
         return pd.DataFrame(results)
 
     def get_expected_cost(self) -> float:
         """Get expected total cost across all scenarios."""
-        return pyo.value(self.model.obj)
+        if self._ef is not None:
+            return self._ef.get_objective_value()
+        # For PH, compute from scenario results
+        df = self.get_scenario_results()
+        return (df['total_cost'] * df['probability']).sum()
 
     def get_cost_statistics(self) -> Dict[str, float]:
         """Calculate cost statistics across scenarios."""
@@ -686,7 +825,7 @@ class StochasticProductionOptimizer:
 
         print("=" * 60)
         print("STATIC-DYNAMIC STOCHASTIC OPTIMIZATION RESULTS")
-        print("(Multi-Echelon with Demand Uncertainty)")
+        print("(Multi-Echelon with Demand Uncertainty — via mpi-sppy)")
         print("=" * 60)
 
         print("\n--- FIRST-STAGE DECISIONS (Static) ---")

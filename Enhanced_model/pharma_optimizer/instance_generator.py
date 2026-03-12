@@ -8,6 +8,10 @@ import random
 import pandas as pd
 from openpyxl.utils import get_column_letter
 
+MAX_PRODUCTION_CAPACITY = 100000
+MAX_MANUFACTURING_COST = 100000
+MAX_TRANSPORT_COST = 101
+
 
 class Generator:
     """Generates random manufacturing and transportation data for optimization models.
@@ -66,8 +70,8 @@ class Generator:
                 data.append({
                     'step': step,
                     'Vendor': self.number_to_letters(option),
-                    'Production': random.randrange(1, 100000),
-                    'Cost': random.randrange(1, 100000)
+                    'Production': random.randrange(1, MAX_PRODUCTION_CAPACITY),
+                    'Cost': random.randrange(1, MAX_MANUFACTURING_COST)
                 })
         return pd.DataFrame(data)
 
@@ -91,7 +95,7 @@ class Generator:
                 for option2 in range(1, self.options + 1):
                     vendor1 = self.number_to_letters(option1)
                     vendor2 = self.number_to_letters(option2)
-                    cost = 0 if vendor1 == vendor2 else random.randrange(1, 101)
+                    cost = 0 if vendor1 == vendor2 else random.randrange(1, MAX_TRANSPORT_COST)
                     data.append({
                         'SourceStep': step,
                         'DestinationStep': step + 1,
