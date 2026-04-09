@@ -462,18 +462,13 @@ def pharma_scenario_creator(
     # One transport route per consecutive step pair
     for i in range(len(ordered_steps) - 1):
         step1, step2 = ordered_steps[i], ordered_steps[i + 1]
-
-        def transport_selection_rule(mdl, s1=step1, s2=step2):
-            valid_routes = [
-                (r1, v1, r2, v2) for (r1, v1, r2, v2) in transport_routes
-                if r1 == s1 and r2 == s2
-            ]
-            if valid_routes:
-                return sum(mdl.y[route] for route in valid_routes) == 1
-            return pyo.Constraint.Skip
-
-        setattr(m, f'transport_selection_{step1}_{step2}',
-                pyo.Constraint(rule=transport_selection_rule))
+        valid_routes = [
+            (r1, v1, r2, v2) for (r1, v1, r2, v2) in transport_routes
+            if r1 == step1 and r2 == step2
+        ]
+        if valid_routes:
+            setattr(m, f'transport_selection_{step1}_{step2}',
+                    pyo.Constraint(expr=sum(m.y[r] for r in valid_routes) == 1))
 
     # Link transport routes to vendor selection
     def link_transport_source(mdl, s1, v1, s2, v2):
