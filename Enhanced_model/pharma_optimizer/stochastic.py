@@ -42,6 +42,20 @@ class DemandScenarioGenerator:
     - Mean (mu) = forecast demand
     - sigma = cv * mu, where cv is coefficient of variation (e.g., 0.2 for 20%)
     - D = max(X, d_min) where d_min is minimum demand (e.g., 5% of mu)
+
+    Reference:
+        Thevenin, S., Adulyasak, Y., & Cordeau, J.-F. (2021). Material
+        Requirements Planning Under Demand Uncertainty Using Stochastic
+        Optimization. Production and Operations Management, 30(2), 475-493.
+        https://doi.org/10.1111/poms.13277
+
+        The paper considers three canonical demand distribution families for
+        MRP/lot-sizing scenario sampling:
+          (1) non-stationary Normal (classical items),
+          (2) Poisson (slow-moving items),
+          (3) zero-inflated Poisson (lumpy/intermittent demand).
+        The normal, non-stationary, slow-moving, and lumpy generators below
+        follow this taxonomy.
     """
 
     def __init__(self, mean_demand: float, cv: float = 0.2, seed: Optional[int] = None):
@@ -97,6 +111,12 @@ class DemandScenarioGenerator:
 
         Uses equiprobable discretization of the truncated normal distribution.
 
+        Reference:
+            Thevenin, Adulyasak, & Cordeau (2021), Prod. & Oper. Management,
+            30(2): 475-493. DOI: 10.1111/poms.13277. Corresponds to the
+            Normal-distribution case used for classical (non-slow-moving,
+            non-lumpy) items in their numerical experiments.
+
         Args:
             num_scenarios: Number of scenarios to generate (3-5 recommended)
 
@@ -144,6 +164,12 @@ class DemandScenarioGenerator:
 
         Returns:
             Dictionary mapping scenario name to (demand, probability)
+
+        Reference:
+            Thevenin, Adulyasak, & Cordeau (2021), Prod. & Oper. Management,
+            30(2): 475-493. DOI: 10.1111/poms.13277. The paper uses a
+            non-stationary Normal process for classical MRP items, where the
+            mean demand varies over the planning horizon.
         """
         # Time-varying mean
         mu_t = (self.mean_demand * (1 + trend_rate * time_point)
@@ -193,6 +219,14 @@ class DemandScenarioGenerator:
 
         Returns:
             Dictionary mapping scenario name to (demand, probability)
+
+        Reference:
+            Thevenin, Adulyasak, & Cordeau (2021), Prod. & Oper. Management,
+            30(2): 475-493. DOI: 10.1111/poms.13277. The paper models lumpy
+            demand with a zero-inflated Poisson distribution; here we use an
+            analogous Bernoulli-LogNormal compound (occurrence + size), which
+            matches the characteristic ADI > 1.32 and CV^2 > 0.49 signature
+            of lumpy demand.
         """
         if num_scenarios < 2:
             raise ValueError("num_scenarios must be >= 2 for lumpy demand")
@@ -243,6 +277,12 @@ class DemandScenarioGenerator:
 
         Returns:
             Dictionary mapping scenario name to (demand, probability)
+
+        Reference:
+            Thevenin, Adulyasak, & Cordeau (2021), Prod. & Oper. Management,
+            30(2): 475-493. DOI: 10.1111/poms.13277. Slow-moving items are
+            modeled with a Poisson demand distribution in the paper's
+            numerical experiments.
         """
         if mean_rate is None:
             mean_rate = self.mean_demand
